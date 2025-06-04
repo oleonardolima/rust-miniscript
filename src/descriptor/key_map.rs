@@ -4,7 +4,11 @@
 
 use core::iter;
 
-use bitcoin::secp256k1::{Secp256k1, Signing};
+use bitcoin::{
+    psbt::{GetKey, GetKeyError, KeyRequest},
+    secp256k1::{Secp256k1, Signing},
+    PrivateKey,
+};
 
 #[cfg(doc)]
 use super::Descriptor;
@@ -85,5 +89,334 @@ impl iter::Extend<(DescriptorPublicKey, DescriptorSecretKey)> for KeyMap {
         T: IntoIterator<Item = (DescriptorPublicKey, DescriptorSecretKey)>,
     {
         self.map.extend(iter)
+    }
+}
+
+impl GetKey for KeyMap {
+    type Error = GetKeyError;
+
+    fn get_key<C: Signing>(
+        &self,
+        key_request: KeyRequest,
+        secp: &Secp256k1<C>,
+    ) -> Result<Option<bitcoin::PrivateKey>, Self::Error> {
+        Ok(self
+            .map
+            .iter()
+            .find_map(|(desc_pk, desc_sk)| -> Option<PrivateKey> {
+                match (desc_sk, key_request.clone()) {
+                    (DescriptorSecretKey::Single(single_priv), key_request) => {
+                        let sk = single_priv.key;
+                        let pk = sk.public_key(secp);
+                        let pubkey_map = BTreeMap::from([(pk, sk)]);
+                        match pubkey_map.get_key(key_request, secp) {
+                            Ok(maybe_pk) => maybe_pk,
+                            Err(_) => None,
+                        }
+                    }
+                    (
+                        DescriptorSecretKey::XPrv(descriptor_xkey),
+                        KeyRequest::Pubkey(public_key),
+                    ) => {
+                        let pk = match desc_pk {
+                            DescriptorPublicKey::XPub(descriptor_xkey) => {
+                                descriptor_xkey.xkey.public_key
+                            }
+                            _ => unreachable!(),
+                        };
+
+                        if public_key.inner.eq(&pk) {
+                            if let Ok(xpriv) = descriptor_xkey
+                                .xkey
+                                .derive_priv(secp, &descriptor_xkey.derivation_path)
+                            {
+                                Some(xpriv.to_priv())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    (
+                        DescriptorSecretKey::XPrv(descriptor_xkey),
+                        ref key_request @ KeyRequest::Bip32(ref key_source),
+                    ) => {
+                        if let Ok(Some(key)) =
+                            descriptor_xkey.xkey.get_key(key_request.clone(), secp)
+                        {
+                            Some(key);
+                        }
+
+                        if let Some(_derivation_path) = descriptor_xkey.matches(key_source, secp) {
+                            let (_fp, derivation_path) = key_source;
+
+                            if let Ok(xpriv) =
+                                descriptor_xkey.xkey.derive_priv(secp, &derivation_path)
+                            {
+                                Some(xpriv.to_priv())
+                            } else {
+                                None
+                            }
+
+                            // if let Some((_fp, origin_derivation_path)) = &descriptor_xkey.origin {
+                            //     let derivation_path: DerivationPath =
+                            //         derivation_path[origin_derivation_path.len()..].into();
+
+                            //     if let Ok(xpriv) =
+                            //         descriptor_xkey.xkey.derive_priv(secp, &derivation_path)
+                            //     {
+                            //         Some(xpriv.to_priv())
+                            //     } else {
+                            //         None
+                            //     }
+
+                            //     // return Some(
+                            //     //     descriptor_xkey
+                            //     //         .xkey
+                            //     //         .derive_priv(secp, &derivation_path)
+                            //     //         .map_err(GetKeyError::Bip32)?
+                            //     //         .to_priv(),
+                            //     // );
+                            // } else {
+                            //     if let Ok(xpriv) =
+                            //         descriptor_xkey.xkey.derive_priv(secp, &derivation_path)
+                            //     {
+                            //         Some(xpriv.to_priv())
+                            //     } else {
+                            //         None
+                            //     }
+
+                            //     // return Some(
+                            //     //     descriptor_xkey
+                            //     //         .xkey
+                            //     //         .derive_priv(secp, derivation_path)
+                            //     //         .map_err(GetKeyError::Bip32)?
+                            //     //         .to_priv(),
+                            //     // );
+                            // }
+                        } else {
+                            None
+                        }
+                    }
+                    (DescriptorSecretKey::XPrv(_), KeyRequest::XOnlyPubkey(_)) => None,
+                    (
+                        DescriptorSecretKey::MultiXPrv(descriptor_multi_xkey),
+                        KeyRequest::Pubkey(_public_key),
+                    ) => {
+                        // let pk = match desc_pk {
+                        //     DescriptorPublicKey::MultiXPub(descriptor_multi_xkey) => {
+                        //         descriptor_multi_xkey.xkey.public_key
+                        //     }
+                        //     _ => unreachable!(),
+                        // };
+
+                        Some(descriptor_multi_xkey.xkey.to_priv())
+                        // if public_key.inner.eq(&pk) {
+                        //     if let Ok(xpriv) = descriptor_multi_xkey
+                        //         .xkey
+                        //         .derive_priv(secp, &descriptor_multi_xkey.derivation_path)
+                        //     {
+                        //         Some(xpriv.to_priv())
+                        //     } else {
+                        //         None
+                        //     }
+                        // } else {
+                        //     None
+                        // }
+                    }
+                    (
+                        DescriptorSecretKey::MultiXPrv(descriptor_multi_xkey),
+                        KeyRequest::Bip32(_),
+                    ) => {
+                        if let Ok(Some(key)) = descriptor_multi_xkey
+                            .xkey
+                            .get_key(key_request.clone(), secp)
+                        {
+                            Some(key)
+                        } else {
+                            None
+                        }
+                    }
+                    (DescriptorSecretKey::MultiXPrv(_), KeyRequest::XOnlyPubkey(_)) => None,
+                    _ => unreachable!(),
+                }
+            }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str::FromStr;
+
+    // use bitcoin::NetworkKind;
+    use bitcoin::bip32::{ChildNumber, DerivationPath, IntoDerivationPath, Xpriv};
+
+    use super::*;
+    use crate::Descriptor;
+
+    #[test]
+    fn get_key_single_key() {
+        let secp = Secp256k1::new();
+
+        let descriptor_sk_s =
+            "[90b6a706/44'/0'/0'/0/0]cMk8gWmj1KpjdYnAWwsEDekodMYhbyYBhG8gMtCCxucJ98JzcNij";
+
+        let single = match descriptor_sk_s.parse::<DescriptorSecretKey>().unwrap() {
+            DescriptorSecretKey::Single(single) => single,
+            _ => panic!("unexpected DescriptorSecretKey variant"),
+        };
+
+        let want_sk = single.key;
+        let descriptor_s = format!("wpkh({})", descriptor_sk_s);
+        let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
+
+        let pk = want_sk.public_key(&secp);
+        let request = KeyRequest::Pubkey(pk);
+        let got_sk = keymap
+            .get_key(request, &secp)
+            .expect("get_key call errored")
+            .expect("failed to find the key");
+        assert_eq!(got_sk, want_sk)
+    }
+
+    #[test]
+    fn get_key_xpriv_single_key_xpriv() {
+        let secp = Secp256k1::new();
+
+        let s = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+
+        let xpriv = s.parse::<Xpriv>().unwrap();
+        let xpriv_fingerprint = xpriv.fingerprint(&secp);
+
+        // Sanity check.
+        {
+            let descriptor_sk_s = format!("[{}]{}", xpriv_fingerprint, xpriv);
+            let descriptor_sk = descriptor_sk_s.parse::<DescriptorSecretKey>().unwrap();
+            let got = match descriptor_sk {
+                DescriptorSecretKey::XPrv(x) => x.xkey,
+                _ => panic!("unexpected DescriptorSecretKey variant"),
+            };
+            assert_eq!(got, xpriv);
+        }
+
+        let want_sk = xpriv.to_priv();
+        let descriptor_s = format!("wpkh([{}]{})", xpriv_fingerprint, xpriv);
+        let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
+
+        let pk = want_sk.public_key(&secp);
+        let request = KeyRequest::Pubkey(pk);
+        let got_sk = keymap
+            .get_key(request, &secp)
+            .expect("get_key call errored")
+            .expect("failed to find the key");
+        assert_eq!(got_sk, want_sk)
+    }
+
+    #[test]
+    fn get_key_xpriv_child_depth_one() {
+        let secp = Secp256k1::new();
+
+        let s = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+        let master = s.parse::<Xpriv>().unwrap();
+        let master_fingerprint = master.fingerprint(&secp);
+
+        let child_number = ChildNumber::from_hardened_idx(44).unwrap();
+        let child = master.derive_priv(&secp, &[child_number]).unwrap();
+
+        // Sanity check.
+        {
+            let descriptor_sk_s = format!("[{}/44']{}", master_fingerprint, child);
+            let descriptor_sk = descriptor_sk_s.parse::<DescriptorSecretKey>().unwrap();
+            let got = match descriptor_sk {
+                DescriptorSecretKey::XPrv(ref x) => x.xkey,
+                _ => panic!("unexpected DescriptorSecretKey variant"),
+            };
+            assert_eq!(got, child);
+        }
+
+        let want_sk = child.to_priv();
+        let descriptor_s = format!("wpkh({}/44')", s);
+        let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
+
+        let pk = want_sk.public_key(&secp);
+        let request = KeyRequest::Pubkey(pk);
+        let got_sk = keymap
+            .get_key(request, &secp)
+            .expect("get_key call errored")
+            .expect("failed to find the key");
+        assert_eq!(got_sk, want_sk)
+    }
+
+    #[test]
+    fn get_key_xpriv_with_path() {
+        let secp = Secp256k1::new();
+
+        let s = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+        let master = s.parse::<Xpriv>().unwrap();
+        let master_fingerprint = master.fingerprint(&secp);
+
+        let first_external_child = "44'/0'/0'/0/0";
+        let derivation_path = first_external_child.into_derivation_path().unwrap();
+
+        let child = master.derive_priv(&secp, &derivation_path).unwrap();
+
+        // Sanity check.
+        {
+            let descriptor_sk_s =
+                format!("[{}/{}]{}", master_fingerprint, first_external_child, child);
+            let descriptor_sk = descriptor_sk_s.parse::<DescriptorSecretKey>().unwrap();
+            let got = match descriptor_sk {
+                DescriptorSecretKey::XPrv(ref x) => x.xkey,
+                _ => panic!("unexpected DescriptorSecretKey variant"),
+            };
+            assert_eq!(got, child);
+        }
+
+        let want_sk = child.to_priv();
+        let descriptor_s = format!("wpkh({}/44'/0'/0'/0/*)", s);
+        let (_, keymap) = Descriptor::parse_descriptor(&secp, &descriptor_s).unwrap();
+
+        let key_source = (master_fingerprint, derivation_path);
+        let request = KeyRequest::Bip32(key_source);
+        let got_sk = keymap
+            .get_key(request, &secp)
+            .expect("get_key call errored")
+            .expect("failed to find the key");
+
+        assert_eq!(got_sk, want_sk)
+    }
+
+    #[test]
+    fn get_key_xpriv_with_key_origin() {
+        let secp = Secp256k1::new();
+
+        let descriptor_str = "wpkh([d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*)";
+        let (_descriptor_pk, keymap) = Descriptor::parse_descriptor(&secp, descriptor_str).unwrap();
+
+        let descriptor_sk = DescriptorSecretKey::from_str("[d34db33f/84h/1h/0h]tprv8ZgxMBicQKsPd3EupYiPRhaMooHKUHJxNsTfYuScep13go8QFfHdtkG9nRkFGb7busX4isf6X9dURGCoKgitaApQ6MupRhZMcELAxTBRJgS/*").unwrap();
+        let xpriv = match descriptor_sk {
+            DescriptorSecretKey::XPrv(descriptor_xkey) => descriptor_xkey,
+            _ => unreachable!(),
+        };
+
+        let path = DerivationPath::from_str("84'/1'/0'/0").unwrap();
+        // let child_number = ChildNumber::from_normal_idx(0).unwrap();
+        // let child = master.derive_priv(&secp, &[child_number]).unwrap();
+        let expected_pk = xpriv
+            .xkey
+            .derive_priv(&secp, &path)
+            .unwrap()
+            .to_priv();
+
+        let (fp, _) = xpriv.origin.unwrap();
+        let key_request = KeyRequest::Bip32((fp, path));
+        
+        let pk = keymap
+            .get_key(key_request, &secp)
+            .expect("get_key should not fail")
+            .expect("get_key should return a `PrivateKey`");
+
+        assert_eq!(pk, expected_pk);
     }
 }
