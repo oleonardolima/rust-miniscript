@@ -103,145 +103,78 @@ impl GetKey for KeyMap {
         Ok(self
             .map
             .iter()
-            .find_map(|(desc_pk, desc_sk)| -> Option<PrivateKey> {
-                match (desc_sk, key_request.clone()) {
-                    (DescriptorSecretKey::Single(single_priv), key_request) => {
-                        let sk = single_priv.key;
-                        let pk = sk.public_key(secp);
-                        let pubkey_map = BTreeMap::from([(pk, sk)]);
-                        match pubkey_map.get_key(key_request, secp) {
-                            Ok(maybe_pk) => maybe_pk,
-                            Err(_) => None,
-                        }
-                    }
-                    (
-                        DescriptorSecretKey::XPrv(descriptor_xkey),
-                        KeyRequest::Pubkey(public_key),
-                    ) => {
-                        let pk = match desc_pk {
-                            DescriptorPublicKey::XPub(descriptor_xkey) => {
-                                descriptor_xkey.xkey.public_key
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        if public_key.inner.eq(&pk) {
-                            if let Ok(xpriv) = descriptor_xkey
-                                .xkey
-                                .derive_priv(secp, &descriptor_xkey.derivation_path)
-                            {
-                                Some(xpriv.to_priv())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    (
-                        DescriptorSecretKey::XPrv(descriptor_xkey),
-                        ref key_request @ KeyRequest::Bip32(ref key_source),
-                    ) => {
-                        if let Ok(Some(key)) =
-                            descriptor_xkey.xkey.get_key(key_request.clone(), secp)
-                        {
-                            Some(key);
-                        }
-
-                        if let Some(_derivation_path) = descriptor_xkey.matches(key_source, secp) {
-                            let (_fp, derivation_path) = key_source;
-
-                            if let Ok(xpriv) =
-                                descriptor_xkey.xkey.derive_priv(secp, &derivation_path)
-                            {
-                                Some(xpriv.to_priv())
-                            } else {
-                                None
-                            }
-
-                            // if let Some((_fp, origin_derivation_path)) = &descriptor_xkey.origin {
-                            //     let derivation_path: DerivationPath =
-                            //         derivation_path[origin_derivation_path.len()..].into();
-
-                            //     if let Ok(xpriv) =
-                            //         descriptor_xkey.xkey.derive_priv(secp, &derivation_path)
-                            //     {
-                            //         Some(xpriv.to_priv())
-                            //     } else {
-                            //         None
-                            //     }
-
-                            //     // return Some(
-                            //     //     descriptor_xkey
-                            //     //         .xkey
-                            //     //         .derive_priv(secp, &derivation_path)
-                            //     //         .map_err(GetKeyError::Bip32)?
-                            //     //         .to_priv(),
-                            //     // );
-                            // } else {
-                            //     if let Ok(xpriv) =
-                            //         descriptor_xkey.xkey.derive_priv(secp, &derivation_path)
-                            //     {
-                            //         Some(xpriv.to_priv())
-                            //     } else {
-                            //         None
-                            //     }
-
-                            //     // return Some(
-                            //     //     descriptor_xkey
-                            //     //         .xkey
-                            //     //         .derive_priv(secp, derivation_path)
-                            //     //         .map_err(GetKeyError::Bip32)?
-                            //     //         .to_priv(),
-                            //     // );
-                            // }
-                        } else {
-                            None
-                        }
-                    }
-                    (DescriptorSecretKey::XPrv(_), KeyRequest::XOnlyPubkey(_)) => None,
-                    (
-                        DescriptorSecretKey::MultiXPrv(descriptor_multi_xkey),
-                        KeyRequest::Pubkey(_public_key),
-                    ) => {
-                        // let pk = match desc_pk {
-                        //     DescriptorPublicKey::MultiXPub(descriptor_multi_xkey) => {
-                        //         descriptor_multi_xkey.xkey.public_key
-                        //     }
-                        //     _ => unreachable!(),
-                        // };
-
-                        Some(descriptor_multi_xkey.xkey.to_priv())
-                        // if public_key.inner.eq(&pk) {
-                        //     if let Ok(xpriv) = descriptor_multi_xkey
-                        //         .xkey
-                        //         .derive_priv(secp, &descriptor_multi_xkey.derivation_path)
-                        //     {
-                        //         Some(xpriv.to_priv())
-                        //     } else {
-                        //         None
-                        //     }
-                        // } else {
-                        //     None
-                        // }
-                    }
-                    (
-                        DescriptorSecretKey::MultiXPrv(descriptor_multi_xkey),
-                        KeyRequest::Bip32(_),
-                    ) => {
-                        if let Ok(Some(key)) = descriptor_multi_xkey
-                            .xkey
-                            .get_key(key_request.clone(), secp)
-                        {
-                            Some(key)
-                        } else {
-                            None
-                        }
-                    }
-                    (DescriptorSecretKey::MultiXPrv(_), KeyRequest::XOnlyPubkey(_)) => None,
-                    _ => unreachable!(),
+            .find_map(|(_desc_pk, desc_sk)| -> Option<PrivateKey> {
+                match desc_sk.get_key(key_request.clone(), secp) {
+                    Ok(Some(pk)) => Some(pk),
+                    Ok(None) | Err(_) => None,
                 }
             }))
+    }
+}
+
+impl GetKey for DescriptorSecretKey {
+    type Error = GetKeyError;
+
+    fn get_key<C: Signing>(
+        &self,
+        key_request: KeyRequest,
+        secp: &Secp256k1<C>,
+    ) -> Result<Option<PrivateKey>, Self::Error> {
+        match (self, key_request) {
+            (DescriptorSecretKey::Single(single_priv), key_request) => {
+                let sk = single_priv.key;
+                let pk = sk.public_key(secp);
+                let pubkey_map = BTreeMap::from([(pk, sk)]);
+                pubkey_map.get_key(key_request, secp)
+            }
+            (DescriptorSecretKey::XPrv(descriptor_xkey), KeyRequest::Pubkey(public_key)) => {
+                let xpriv = descriptor_xkey
+                    .xkey
+                    .derive_priv(secp, &descriptor_xkey.derivation_path)
+                    .map_err(GetKeyError::Bip32)?;
+                let pk = xpriv.private_key.public_key(secp);
+
+                if public_key.inner.eq(&pk) {
+                    Ok(Some(xpriv.to_priv()))
+                } else {
+                    Ok(None)
+                }
+            }
+            (
+                DescriptorSecretKey::XPrv(descriptor_xkey),
+                ref key_request @ KeyRequest::Bip32(ref key_source),
+            ) => {
+                if let Some(key) = descriptor_xkey.xkey.get_key(key_request.clone(), secp)? {
+                    return Ok(Some(key));
+                }
+
+                if let Some(_) = descriptor_xkey.matches(key_source, secp) {
+                    let (_, derivation_path) = key_source;
+                    return Ok(Some(
+                        descriptor_xkey
+                            .xkey
+                            .derive_priv(secp, &derivation_path)
+                            .map_err(GetKeyError::Bip32)?
+                            .to_priv(),
+                    ));
+                }
+
+                Ok(None)
+            }
+            (DescriptorSecretKey::XPrv(_), KeyRequest::XOnlyPubkey(_)) => {
+                Err(GetKeyError::NotSupported)
+            }
+            (
+                desc_multi_sk @ DescriptorSecretKey::MultiXPrv(_descriptor_multi_xkey),
+                key_request,
+            ) => Ok(desc_multi_sk.clone().into_single_keys().iter().find_map(
+                |desc_sk| match desc_sk.get_key(key_request.clone(), secp) {
+                    Ok(Some(pk)) => Some(pk),
+                    Ok(None) | Err(_) => None,
+                },
+            )),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -403,15 +336,11 @@ mod tests {
         let path = DerivationPath::from_str("84'/1'/0'/0").unwrap();
         // let child_number = ChildNumber::from_normal_idx(0).unwrap();
         // let child = master.derive_priv(&secp, &[child_number]).unwrap();
-        let expected_pk = xpriv
-            .xkey
-            .derive_priv(&secp, &path)
-            .unwrap()
-            .to_priv();
+        let expected_pk = xpriv.xkey.derive_priv(&secp, &path).unwrap().to_priv();
 
         let (fp, _) = xpriv.origin.unwrap();
         let key_request = KeyRequest::Bip32((fp, path));
-        
+
         let pk = keymap
             .get_key(key_request, &secp)
             .expect("get_key should not fail")
